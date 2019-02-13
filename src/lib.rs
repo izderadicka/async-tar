@@ -2,7 +2,7 @@ extern crate tar;
 extern crate tokio;
 
 use futures::future::poll_fn;
-use std::ffi::OsString;
+use std::ffi::{OsString, OsStr};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -11,6 +11,26 @@ use tokio::fs as tokio_fs;
 use tokio::prelude::*;
 
 const EMPTY_BLOCK: [u8; 512] = [0; 512];
+const BUFFER_LENGTH: usize = 8 * 1024; // must be multiple of 512 !!!
+const PATH_MAX_LEN: usize = 100; // this is limitation of basic tar header
+
+fn cut_path<P: AsRef<OsStr>>(p:P, max_len: usize) -> OsString {
+ let s: OsString = p.as_ref().into();
+ if s.len() > max_len {
+     let path = Path::new(&s);
+     let ext = path.extension().and_then(|e| e.to_str());
+     let ext_len = ext.map(|e| e.len()+1).unwrap_or(0);
+     let base = path.file_stem().unwrap().to_string_lossy();
+     let mut name: String = base.chars().take(max_len-ext_len).collect();
+     if ext_len>0 {
+        name.push('.');
+        name.push_str(ext.unwrap());
+     }
+     name.into() 
+ } else {
+     s
+ }
+}
 
 enum TarState {
     BeforeNext,
@@ -39,17 +59,31 @@ enum TarState {
     },
 }
 
-pub struct TarStream {
+///
+/// Tar archive as a Stream
+/// Sends chunks of tar archive, which are either tar headers or blocks of data from files
+/// 
+/// This tar is especially created to send content of directory in HTTP response, 
+/// so it does not provide real metadata of files (not to reveal unnecessary details of local implementation).
+/// 
+/// Only file name is stored in tar (limited to 100 chars), so it's not intended for hiearchical archives.
+/// 
+pub struct TarStream<P> {
     state: Option<TarState>,
-    iter: Box<dyn Iterator<Item = PathBuf> + Send>,
+    iter: Box<dyn Iterator<Item = P> + Send>,
     position: usize,
-    buf: [u8; 8 * 1024],
+    buf: [u8; BUFFER_LENGTH],
 }
 
-impl TarStream {
+impl TarStream<PathBuf> {
+    ///
+    /// Create stream that tars all files in given directory
+    /// 
+    /// Returns furture that resolves to this stream
+    /// (as directory listing is done asychronously)
     pub fn tar_dir<P: AsRef<Path> + Send>(
         dir: P,
-    ) -> Box<Future<Item = Self, Error = io::Error> + Send> {
+    ) -> impl Future<Item = Self, Error = io::Error> + Send {
         let dir: PathBuf = dir.as_ref().to_owned();
         let dir = tokio_fs::read_dir(dir).flatten_stream();
 
@@ -74,15 +108,34 @@ impl TarStream {
                 state,
                 iter: Box::new(iter),
                 position: 0,
-                buf: [0; 8 * 1024],
+                buf: [0; BUFFER_LENGTH],
             }
         });
 
-        Box::new(ts)
+        ts
     }
 }
 
-impl Stream for TarStream {
+impl <P: AsRef<Path> + Send> TarStream<P> {
+    ///
+    /// Create stream that tars files from given path iterator
+    /// 
+    pub fn tar_iter<I>(iter:I) -> Self 
+    where I: Iterator<Item=P> + Send  + 'static
+
+    {
+        TarStream {
+            state: Some(TarState::BeforeNext),
+            iter: Box::new(iter),
+            position: 0,
+            buf: [0; BUFFER_LENGTH],
+
+        }
+
+    }
+}
+
+impl <P: AsRef<Path> + Send> Stream for TarStream<P> {
     type Item = Vec<u8>;
     type Error = io::Error;
     fn poll(&mut self) -> Result<Async<Option<Self::Item>>, Self::Error> {
@@ -97,12 +150,12 @@ impl Stream for TarStream {
                                 self.state = Some(TarState::Finish { block: 0 });
                             }
                             Some(path) => {
-                                self.state = Some(TarState::NextFile { path });
+                                self.state = Some(TarState::NextFile { path: path.as_ref().to_owned() });
                             }
                         },
                         // we start with async opening of file
                         TarState::NextFile { path } => {
-                            let fname = path.file_name().map(|name| name.to_owned()).unwrap();
+                            let fname = path.file_name().map(|name| cut_path(name, PATH_MAX_LEN)).unwrap();
                             let file = tokio_fs::File::open(path);
                             self.state = Some(TarState::OpeningFile { file, fname });
                         }
@@ -170,10 +223,9 @@ impl Stream for TarStream {
                                             let padding_length =
                                                 if rem > 0 { 512 - rem } else { 0 };
                                             let new_position = self.position + padding_length;
-                                            // zeroing padding, hoping compiler can optimize
-                                            for i in &mut self.buf[self.position..new_position] {
-                                                *i = 0
-                                            }
+                                            // zeroing padding
+                                            &mut self.buf[self.position..new_position]
+                                                .copy_from_slice(&mut EMPTY_BLOCK[..padding_length]);
                                             return Ok(Async::Ready(Some(
                                                 self.buf[..new_position].to_vec(),
                                             )));
@@ -218,7 +270,31 @@ mod tests {
     use tokio::codec::Decoder;
 
     #[test]
-    fn create_tar() {
+    fn test_tar_from_iter() {
+        let temp_dir = tempdir().unwrap();
+        let tar_file_name = temp_dir.path().join("test2.tar");
+        let tar_file_name2 = tar_file_name.clone();
+        let files = &[".gitignore", "Cargo.lock", "Cargo.toml"];
+        let tar_stream = TarStream::tar_iter(files.into_iter());
+
+        {
+            let tar_file = tokio_fs::File::create(tar_file_name);
+            let f = tar_file.and_then(|f| {
+                let codec = tokio::codec::BytesCodec::new();
+                let file_sink = codec.framed(f);
+                file_sink.send_all(tar_stream.map(|v| v.into()))
+            })
+            .map(|_r| ())
+                .map_err(|e| eprintln!("Error during tar creation: {}", e));
+
+            tokio::run(f);
+        }
+        check_archive(tar_file_name2, 3);
+        temp_dir.close().unwrap();
+    }
+
+    #[test]
+    fn test_create_tar() {
         let tar = TarStream::tar_dir(".");
         let temp_dir = tempdir().unwrap();
         let tar_file_name = temp_dir.path().join("test.tar");
@@ -244,7 +320,12 @@ mod tests {
 
 
         
-        let mut ar = tar::Archive::new(fs::File::open(tar_file_name2).unwrap());
+        check_archive(tar_file_name2, 4);
+        temp_dir.close().unwrap();
+    }
+
+    fn check_archive(p:PathBuf, num_files: usize) {
+        let mut ar = tar::Archive::new(fs::File::open(p).unwrap());
 
         let entries = ar.entries().unwrap();
         let mut count = 0;
@@ -283,8 +364,23 @@ mod tests {
             count+=1;
         }
 
-        assert_eq!(3, count, "There are 3 files in dir");
-        temp_dir.close().unwrap();
+        assert_eq!(num_files, count, "There are {} files in archive", num_files);
+    }
+
+    #[test]
+    fn test_cut_path() {
+        let a = "abcdef";
+        let x = cut_path(a, 10);
+        assert_eq!(a, x.to_str().unwrap(), "under limit");
+
+        let a ="0123456789abcd";
+        let x = cut_path(a, 10);
+        assert_eq!("0123456789", x.to_str().unwrap(), "over limit, no ext");
+
+        let a ="0123456789abcd.mp3";
+        let x = cut_path(a, 10);
+        assert_eq!("012345.mp3", x.to_str().unwrap(), "over limit, no ext");
+
     }
 
 }
