@@ -73,6 +73,7 @@ pub struct TarStream<P> {
     iter: Box<dyn Iterator<Item = P> + Send>,
     position: usize,
     buf: [u8; BUFFER_LENGTH],
+    base_dir: Option<PathBuf>
 }
 
 impl TarStream<PathBuf> {
@@ -109,6 +110,7 @@ impl TarStream<PathBuf> {
                 iter: Box::new(iter),
                 position: 0,
                 buf: [0; BUFFER_LENGTH],
+                base_dir: None
             }
         });
 
@@ -129,9 +131,33 @@ impl <P: AsRef<Path> + Send> TarStream<P> {
             iter: Box::new(iter),
             position: 0,
             buf: [0; BUFFER_LENGTH],
+            base_dir: None
 
         }
 
+    }
+
+    pub fn tar_iter_rel<I, B: AsRef<Path>>(iter:I, base_dir:B) -> Self 
+    where I: Iterator<Item=P> + Send  + 'static {
+        TarStream {
+            state: Some(TarState::BeforeNext),
+            iter: Box::new(iter),
+            position: 0,
+            buf: [0; BUFFER_LENGTH],
+            base_dir: Some(base_dir.as_ref().into())
+
+        }
+    }
+}
+
+impl <P> TarStream<P> {
+    fn full_path(&self, rel: PathBuf) -> PathBuf {
+        match self.base_dir {
+            Some(ref p) => {
+                p.clone().join(rel)
+            }
+            None => rel
+        }
     }
 }
 
@@ -156,7 +182,7 @@ impl <P: AsRef<Path> + Send> Stream for TarStream<P> {
                         // we start with async opening of file
                         TarState::NextFile { path } => {
                             let fname = path.file_name().map(|name| cut_path(name, PATH_MAX_LEN)).unwrap();
-                            let file = tokio_fs::File::open(path);
+                            let file = tokio_fs::File::open(self.full_path(path));
                             self.state = Some(TarState::OpeningFile { file, fname });
                         }
 
@@ -275,7 +301,7 @@ mod tests {
         let tar_file_name = temp_dir.path().join("test2.tar");
         let tar_file_name2 = tar_file_name.clone();
         let files = &[".gitignore", "Cargo.lock", "Cargo.toml"];
-        let tar_stream = TarStream::tar_iter(files.into_iter());
+        let tar_stream = TarStream::tar_iter_rel(files.into_iter(), std::env::current_dir().unwrap());
 
         {
             let tar_file = tokio_fs::File::create(tar_file_name);
