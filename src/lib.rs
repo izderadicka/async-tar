@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs as tokio_fs;
 use tokio::prelude::*;
+use std::iter::IntoIterator;
 
 const EMPTY_BLOCK: [u8; 512] = [0; 512];
 const BUFFER_LENGTH: usize = 8 * 1024; // must be multiple of 512 !!!
@@ -57,6 +58,15 @@ enum TarState {
     Finish {
         block: u8,
     },
+}
+
+///
+/// Calculates size of tar archive from list/iterator of known sizes of it's content.
+/// Works only for our case - e.g. contains files only
+/// 
+pub fn calc_size<S:IntoIterator<Item=u64>>(sizes:S) -> u64 {
+    sizes.into_iter().fold(1024, |total,sz| total + 512+ 512*((sz+511)/512))
+
 }
 
 ///
@@ -301,6 +311,8 @@ mod tests {
         let tar_file_name = temp_dir.path().join("test2.tar");
         let tar_file_name2 = tar_file_name.clone();
         let files = &[".gitignore", "Cargo.lock", "Cargo.toml"];
+        let sizes = files.iter().map(|f| Path::new(f).metadata().unwrap().len());
+        let expected_archive_len = calc_size(sizes);
         let tar_stream = TarStream::tar_iter_rel(files.into_iter(), std::env::current_dir().unwrap());
 
         {
@@ -315,6 +327,8 @@ mod tests {
 
             tokio::run(f);
         }
+        let archive_len = tar_file_name2.metadata().unwrap().len();
+        assert_eq!(archive_len, expected_archive_len, "archive size is as expected");
         check_archive(tar_file_name2, 3);
         temp_dir.close().unwrap();
     }
